@@ -16,7 +16,7 @@
     "strict": true
   },
   "include": [
-    "App.tsx",
+    "src/App.tsx",
     "src/**/*.ts",
     "src/**/*.tsx",
     "__tests__/**/*.ts",
