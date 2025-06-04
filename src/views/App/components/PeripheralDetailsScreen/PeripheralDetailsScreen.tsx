@@ -1,15 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { View, Text, StyleSheet, ScrollView, TextInput, Button, NativeEventEmitter, NativeModules, Modal, TouchableOpacity, Dimensions, Platform, Animated, Easing } from 'react-native';
 // Using a simple text icon for now, you can replace with an SVG or image library
 // import { BarChartIcon } from './your-icon-library'; // Example if you have one
 import { Buffer } from 'buffer';
 import BleManager, { 
   BleManagerDidUpdateValueForCharacteristicEvent, 
-  PeripheralInfo
+  PeripheralInfo,
+  Characteristic
 } from 'react-native-ble-manager';
+
+// Extend the Characteristic type to include isNotifying
+declare module 'react-native-ble-manager' {
+  interface Characteristic {
+    isNotifying?: boolean;
+  }
+}
 import { LineChart } from 'react-native-gifted-charts';
 import HeatmapChart from '../HeatmapChart/HeatmapChart';
+// No topo do PeripheralDetailsScreen.tsx
+import { FitProConstants, buildFitProCommand, PKT_IDX } from './utils/FitProConstants'; // Ajuste o caminho
+import { decodeFitProMessage } from './utils/FitProDecoder';
 
+// Create the BLE manager emitter at the module level
+const bleManagerEmitter = NativeModules.BleManager 
+  ? new NativeEventEmitter(NativeModules.BleManager) 
+  : null;
 // Define interfaces for your peripheral's properties
 // Standard BLE UUIDs
 const DEVICE_INFO_SERVICE = '180A';
@@ -38,18 +53,308 @@ interface PeripheralDetailsProps {
   };
 }
 
+// Types for FITPRO_COMMANDS
+type CommandGroup = {
+  name: string;
+  commands: Record<number, string>;
+};
+
+type FitProCommands = Record<number, CommandGroup>;
+
 // Battery Icon Component
 const BatteryIcon = ({ level = 'N/A' }) => {
-  if (level === 'N/A') return <Text>🔋</Text>;
-  
-  const batteryLevel = parseInt(level);
-  let batteryColor = '#4CD964'; // Green
+  // Default to 100% if level is not a number
+  let batteryLevel = typeof level === 'number' ? level : 100;
+  let batteryColor = '#34C759'; // Green
   
   if (batteryLevel <= 20) batteryColor = '#FF3B30'; // Red
   else if (batteryLevel <= 50) batteryColor = '#FFCC00'; // Yellow
   
   const fillWidth = Math.min(20, Math.max(2, (20 * batteryLevel) / 100));
+  const FITPRO_COMMANDS: FitProCommands = {
+    // Grupo 0x12 - Comandos Gerais
+    0x12: {
+      name: 'General',
+      commands: {
+        0x01: 'Set Date/Time',
+        0x02: 'Set Alarm',
+        0x03: 'Set Step Goal',
+        0x04: 'Set User Data',
+        0x05: 'Set Long Sit Reminder',
+        0x06: 'Set Arm',
+        0x07: 'Enable Notifications',
+        0x08: 'Set Device Vibrations',
+        0x09: 'Set Display on Lift',
+        0x0A: 'Init1',
+        0x0B: 'Find Band',
+        0x0C: 'Camera',
+        0x0D: 'Get Heart Rate',
+        0x0E: 'Get Blood Pressure',
+        0x0F: 'Set Sleep Times',
+        0x11: 'Notification Call',
+        0x12: 'Notification Message',
+        0x14: 'Do Not Disturb',
+        0x15: 'Set Language',
+        0x18: 'Heart Rate Measurement',
+        0x20: 'Weather',
+        0x21: 'Set Temperature Unit',
+        0xFF: 'Init3'
+      }
+    },
+    // Grupo 0x15 - Dados Esportivos
+    0x15: {
+      name: 'Sports Data',
+      commands: {
+        0x01: 'Sports Key',
+        0x02: 'Step Data',
+        0x03: 'Sleep Data',
+        0x06: 'Day Steps Summary',
+        0x07: 'Steps Data Type 7',
+        0x08: 'Steps Data Type 8',
+        0x0C: 'Sports Day Data',
+        0x0D: 'Fetch Day Steps',
+        0x0E: 'Heart Rate Data',
+        0x10: 'Steps Data Type 16',
+        0x18: 'Sports Measurement'
+      }
+    },
+    // Grupo 0x16 - Configurações de Batimentos
+    0x16: {
+      name: 'Heart Rate Settings',
+      commands: {}
+    },
+    // Grupo 0x1A - Requisição de Dados
+    0x1A: {
+      name: 'Request Data',
+      commands: {
+        0x01: 'Unknown Request 1',
+        0x02: 'Get Steps Target',
+        0x08: 'Get Auto HR',
+        0x0A: 'Unknown Request A',
+        0x0C: 'Unknown Request C',
+        0x0D: 'Get Contacts',
+        0x0F: 'Unknown Request F',
+        0x10: 'Get HW Info'
+      }
+    },
+    // Grupo 0x1C - Dados de Botões
+    0x1C: {
+      name: 'Button Data',
+      commands: {
+        0x01: 'Find Phone',
+        0x02: 'Camera Button 1',
+        0x03: 'Camera Button 2',
+        0x04: 'Camera Button 3',
+        0x0A: 'Media Back',
+        0x0B: 'Media Play/Pause',
+        0x0C: 'Media Forward'
+      }
+    },
+    // Grupo 0x1D - Reset
+    0x1D: {
+      name: 'Reset',
+      commands: {
+        0x01: 'Reset Device'
+      }
+    },
+    // Grupo 0x20 - Informações da Banda
+    0x20: {
+      name: 'Band Info',
+      commands: {
+        0x02: 'Band Info',
+        0x23: 'Get Band Name'
+      }
+    }
+  };
+
+// Função principal de decodificação
+const decodeFitProMessage = (rawBytes: number[]): string => {
+  if (!rawBytes || rawBytes.length < 5) {
+    return "❌ Mensagem muito curta para decodificar";
+  }
   
+  const header = rawBytes[0];
+  let decoded = "";
+  
+  // Se for ACK (0xDC)
+  if (header === 0xDC) {
+    decoded += "📥 **ACK Recebido**\n";
+    
+    if (rawBytes.length >= 5) {
+      const cmdGroup = rawBytes[3];
+      const command = rawBytes[4];
+      
+      const groupInfo = FITPRO_COMMANDS[cmdGroup];
+      const cmdName = groupInfo?.commands[command] || `Unknown (0x${command.toString(16)})`;
+      const groupName = groupInfo?.name || `Unknown Group (0x${cmdGroup.toString(16)})`;
+      
+      decoded += `   ✅ Confirmação de: ${cmdName}\n`;
+      decoded += `   📁 Grupo: ${groupName}\n`;
+      
+      // ACKs especiais com significado
+      if (cmdGroup === 0x12) {
+        switch (command) {
+          case 0x0B:
+            decoded += "   💫 **O relógio está vibrando!**\n";
+            break;
+          case 0x12:
+            decoded += "   💬 **Notificação exibida no display!**\n";
+            break;
+          case 0x11:
+            decoded += "   📞 **Chamada exibida no display!**\n";
+            break;
+          case 0x01:
+            decoded += "   ⏰ **Data/Hora configurada!**\n";
+            break;
+        }
+      }
+    }
+    
+    // Detalhes técnicos
+    decoded += `\n📊 Detalhes: [${rawBytes.join(', ')}]`;
+    
+  } 
+  // Se for pacote de dados (0xCD)
+  else if (header === 0xCD) {
+    decoded += "📦 **Pacote de Dados**\n";
+    
+    if (rawBytes.length >= 8) {
+      const cmdGroup = rawBytes[3];
+      const command = rawBytes[5];
+      const payloadLen = (rawBytes[6] << 8) | rawBytes[7];
+      
+      const groupInfo = FITPRO_COMMANDS[cmdGroup];
+      const cmdName = groupInfo?.commands[command] || `Unknown (0x${command.toString(16)})`;
+      const groupName = groupInfo?.name || `Unknown Group (0x${cmdGroup.toString(16)})`;
+      
+      decoded += `   📋 Comando: ${cmdName}\n`;
+      decoded += `   📁 Grupo: ${groupName}\n`;
+      decoded += `   📏 Tamanho do payload: ${payloadLen} bytes\n`;
+      
+      // Decodificar payload específico
+      if (payloadLen > 0 && rawBytes.length >= 8 + payloadLen) {
+        const payload = rawBytes.slice(8, 8 + payloadLen);
+        
+        // Decodificação específica por comando
+        if (cmdGroup === 0x1A && command === 0x10) {
+          // HW Info
+          decoded += "\n🔧 **Informações de Hardware:**\n";
+          decoded += decodeHardwareInfo(payload);
+        } 
+        else if (cmdGroup === 0x15 && command === 0x02) {
+          // Dados de Passos
+          decoded += "\n🚶 **Dados de Passos:**\n";
+          decoded += decodeStepsData(payload);
+        }
+        else if (cmdGroup === 0x15 && command === 0x0E) {
+          // Dados de Batimentos
+          decoded += "\n❤️ **Dados de Batimentos:**\n";
+          decoded += decodeHeartRateData(payload);
+        }
+        else if (cmdGroup === 0x1C) {
+          // Botão pressionado no relógio
+          decoded += "\n🔘 **Ação do Usuário no Relógio:**\n";
+          switch (command) {
+            case 0x01:
+              decoded += "   📱 Usuário ativou 'Encontrar Telefone'!\n";
+              break;
+            case 0x02:
+            case 0x03:
+            case 0x04:
+              decoded += "   📸 Usuário ativou controle de câmera!\n";
+              break;
+            case 0x0B:
+              decoded += "   ⏯️ Usuário pressionou Play/Pause!\n";
+              break;
+            case 0x0C:
+              decoded += "   ⏭️ Usuário pressionou Próxima!\n";
+              break;
+            case 0x0A:
+              decoded += "   ⏮️ Usuário pressionou Anterior!\n";
+              break;
+          }
+        }
+        else {
+          // Payload genérico
+          decoded += `\n📝 Payload (hex): ${Buffer.from(payload).toString('hex')}`;
+        }
+      }
+    }
+    
+    decoded += `\n📊 Raw: [${rawBytes.join(', ')}]`;
+  }
+  // Mensagem desconhecida
+  else {
+    decoded += `❓ Tipo desconhecido (Header: 0x${header.toString(16)})\n`;
+    decoded += `📊 Bytes: [${rawBytes.join(', ')}]\n`;
+    
+    // Tenta decodificar como texto
+    try {
+      const text = Buffer.from(rawBytes).toString('utf8');
+      if (text && isPrintableText(text)) {
+        decoded += `📝 Como texto: "${text}"`;
+      }
+    } catch (e) {
+      // Não é texto
+    }
+  }
+  
+  return decoded;
+};
+
+// Funções auxiliares de decodificação
+const decodeHardwareInfo = (payload: number[]): string => {
+  let result = "";
+  let offset = 0;
+  
+  // HW Info geralmente tem 2 strings
+  if (offset < payload.length) {
+    const len1 = payload[offset++];
+    if (offset + len1 <= payload.length) {
+      const str1 = Buffer.from(payload.slice(offset, offset + len1)).toString('utf8');
+      result += `   Modelo: ${str1}\n`;
+      offset += len1;
+    }
+  }
+  
+  if (offset < payload.length) {
+    const len2 = payload[offset++];
+    if (offset + len2 <= payload.length) {
+      const str2 = Buffer.from(payload.slice(offset, offset + len2)).toString('utf8');
+      result += `   Versão: ${str2}\n`;
+    }
+  }
+  
+  return result || "   (Não foi possível decodificar)\n";
+};
+
+const decodeStepsData = (payload: number[]): string => {
+  if (payload.length >= 4) {
+    const steps = (payload[0] << 24) | (payload[1] << 16) | 
+                  (payload[2] << 8) | payload[3];
+    return `   Total de passos: ${steps.toLocaleString()}\n`;
+  }
+  return "   (Dados insuficientes)\n";
+};
+
+const decodeHeartRateData = (payload: number[]): string => {
+  if (payload.length >= 2) {
+    const hr = payload[1]; // Geralmente no byte 1
+    return `   Batimentos: ${hr} bpm\n`;
+  }
+  return "   (Dados insuficientes)\n";
+};
+
+// Componente visual para mostrar mensagens decodificadas
+const FitProMessageDecoder = ({ message }: { message: number[] }) => {
+  const decoded = decodeFitProMessage(message);
+  
+  return (
+    <View style={styles.decodedMessageBox}>
+      <Text style={styles.decodedMessageText}>{decoded}</Text>
+    </View>
+  );
+};
   return (
     <View style={styles.batteryContainer}>
       <View style={styles.batteryOutline}>
@@ -125,19 +430,87 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
       // Device identified as LT716. Setting NUS UUIDs for writing.
       setServiceToWrite(LT716_NUS_SERVICE_UUID);
       setCharToWrite(LT716_NUS_CHAR_RX_UUID);
-    } else if (isMac) {
-      // Example for Mac - actual writable chars might vary or be restricted
-      // Device identified as Mac.
-      // setServiceToWrite('d0611e78-bbb4-4591-a5f8-487910ae4366'); // Example
-      // setCharToWrite('8667556c-9a37-4c91-84ed-54ee27d90049'); // Example
-    }
-    // Add other device types if needed
+    } 
 
     return () => {
       setServiceToWrite('');
       setCharToWrite('');
     };
   }, [peripheralId, isLT716, isMac]);
+
+  // Ensure notifications are started after connection
+  const ensureNotificationsStarted = useCallback(async () => {
+    if (!peripheralId || !isLT716) return;
+    
+    console.log('🔔 Garantindo que notificações estejam ativas...');
+    
+    // Aguardar um pouco após conexão
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    try {
+      // Verificar se já está notificando
+      const services = await BleManager.retrieveServices(peripheralId);
+      const txChar = services.characteristics?.find(c => 
+        c.characteristic.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase()
+      );
+      
+      if (txChar && !txChar.isNotifying) {
+        console.log('⚠️ Notificações não estão ativas, iniciando...');
+        await BleManager.startNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID);
+        console.log('✅ Notificações iniciadas com sucesso!');
+      } else if (txChar?.isNotifying) {
+        console.log('✅ Notificações já estão ativas');
+      }
+    } catch (error) {
+      console.error('❌ Erro ao verificar/iniciar notificações:', error);
+    }
+  }, [peripheralId, isLT716]);
+
+  // Call ensureNotificationsStarted after component mounts and when peripheralId or isLT716 changes
+  useEffect(() => {
+    if (peripheralId && isLT716) {
+      ensureNotificationsStarted();
+    }
+  }, [peripheralId, isLT716, ensureNotificationsStarted]);
+
+  // Function to restart notifications
+  const restartNotifications = async () => {
+    if (!peripheralId || !isLT716) return;
+    
+    try {
+      console.log('Restarting notifications...');
+      
+      // Stop existing notifications
+      try {
+        await BleManager.stopNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID);
+      } catch (e) {
+        console.log('No existing notification to stop');
+      }
+      
+      // Wait a bit
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Restart notifications
+      try {
+        await BleManager.startNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID);
+        console.log('✅ LT716 NUS TX notifications started');
+        console.log('✅ Notifications restarted successfully');
+        
+        setNotificationLog(prev => 
+          `🔄 [${new Date().toLocaleTimeString()}] Notifications restarted\n${prev}`
+        );
+      } catch (error) {
+        console.error('❌ Failed to start LT716 NUS TX notifications:', error);
+        throw error; // Re-throw to be caught by the outer try-catch
+      }
+      
+    } catch (error) {
+      console.error('Failed to restart notifications:', error);
+      setNotificationLog(prev => 
+        `❌ [${new Date().toLocaleTimeString()}] Failed to restart notifications\n${prev}`
+      );
+    }
+  };
 
   // Function to read general device information
   const readDeviceInfo = async () => {
@@ -276,163 +649,479 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
       if (intervalId) clearInterval(intervalId);
     };
   }, [peripheralId, rssiModalVisible]);
-
+  const initializeLT716Device = async () => {
+    console.log('🚀 Starting LT716 initialization sequence...');
+    
+    try {
+      // 1. Set current date/time
+      const now = new Date();
+      const dateTimePayload = [
+        now.getFullYear() - 2000,  // Year (2-digit)
+        now.getMonth() + 1,         // Month (1-12)
+        now.getDate(),              // Day
+        now.getHours(),             // Hour
+        now.getMinutes(),           // Minute
+        now.getSeconds()            // Second
+      ];
+      
+      await writeBytesToDevice(
+        buildFitProCommand(
+          FitProConstants.CMD_GROUP_GENERAL,
+          FitProConstants.CMD_SET_DATE_TIME,
+          dateTimePayload
+        ),
+        "Set Date/Time"
+      );
+      
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // 2. Set user info (example values)
+      const userInfoPayload = [
+        0x01,    // Gender (1=male, 2=female)
+        25,      // Age
+        175,     // Height in cm
+        70,      // Weight in kg
+        10000 >> 8, 10000 & 0xFF  // Step goal (10000 steps)
+      ];
+      
+      await writeBytesToDevice(
+        buildFitProCommand(
+          FitProConstants.CMD_GROUP_GENERAL,
+          FitProConstants.CMD_SET_USER_INFO,
+          userInfoPayload
+        ),
+        "Set User Info"
+      );
+      
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // 3. Set language (0x01 = English)
+      await writeBytesToDevice(
+        buildFitProCommand(
+          FitProConstants.CMD_GROUP_GENERAL,
+          FitProConstants.CMD_SET_LANGUAGE,
+          [0x01]
+        ),
+        "Set Language"
+      );
+      
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // 4. Now try to get HW info
+      console.log('📱 Initialization complete, requesting HW info...');
+      await sendGetHwInfoFitPro();
+      
+    } catch (error) {
+      console.error('❌ Initialization failed:', error);
+      setNotificationLog(prev => 
+        `❌ [${new Date().toLocaleTimeString()}] Init failed: ${error}\n${prev}`
+      );
+    }
+  };
+  const sendTextAsNotification = async (text: string, icon: number = 0x01) => {
+    try {
+      // Converte o texto para bytes UTF-8
+      const textBytes = Array.from(Buffer.from(text, 'utf8'));
+      
+      // Limite de 20 bytes por pacote BLE, menos o overhead do protocolo
+      const maxTextLength = 12; // Ajuste conforme necessário
+      const truncatedBytes = textBytes.slice(0, maxTextLength);
+      
+      // Monta o payload da notificação
+      const payload = [
+        icon, // Ícone da notificação (0x01 = SMS)
+        ...truncatedBytes
+      ];
+      
+      // Envia como comando de notificação
+      const commandBytes = buildFitProCommand(
+        FitProConstants.CMD_GROUP_GENERAL,
+        FitProConstants.CMD_NOTIFICATION_MESSAGE,
+        payload
+      );
+      
+      console.log('📱 Enviando texto como notificação:', text);
+      await writeBytesToDevice(commandBytes, `Notification: "${text}"`);
+      
+      // O dispositivo deve vibrar e mostrar o texto
+      setReadData(prev => 
+        `📱 Texto enviado como notificação: "${text}"\n${prev}`.slice(0, 1000)
+      );
+      
+    } catch (error) {
+      console.error('Erro ao enviar texto:', error);
+      setReadData(prev => 
+        `❌ Erro ao enviar texto: ${error}\n${prev}`.slice(0, 1000)
+      );
+    }
+  };
+  const interpretResponseAsText = (rawBytes: number[]): string | null => {
+    
+    // Tenta extrair texto de payloads conhecidos
+    if (!rawBytes || rawBytes.length < PKT_IDX.PAYLOAD_START) {
+      return null;
+    }
+    
+    const header = rawBytes[PKT_IDX.HEADER];
+    
+    // Se for um pacote de dados (não ACK)
+    if (header === FitProConstants.DATA_HEADER) {
+      const payloadLen = (rawBytes[PKT_IDX.PAYLOAD_LEN_HI] << 8) | 
+                         rawBytes[PKT_IDX.PAYLOAD_LEN_LO];
+      
+      if (payloadLen > 0 && rawBytes.length >= PKT_IDX.PAYLOAD_START + payloadLen) {
+        const payload = rawBytes.slice(PKT_IDX.PAYLOAD_START, 
+                                       PKT_IDX.PAYLOAD_START + payloadLen);
+        
+        // Tenta decodificar como UTF-8
+        try {
+          const text = Buffer.from(payload).toString('utf8').trim();
+          if (text && text.length > 0 && isPrintableText(text)) {
+            return text;
+          }
+        } catch (e) {
+          // Não é texto válido
+        }
+      }
+    }
+    
+    return null;
+  };
+  const isPrintableText = (str: string): boolean => {
+    // Verifica se contém apenas caracteres imprimíveis
+    return /^[\x20-\x7E\u00A0-\uFFFF]*$/.test(str);
+  };    
   // Notification handling effect with timing test
   useEffect(() => {
     let isMounted = true;
     let notificationListener: ReturnType<NativeEventEmitter['addListener']> | null = null;
-
-    // Starting notification effect for peripheral
-
-    if (!peripheralId) {
-      // Peripheral ID is null, skipping notification setup
-      return () => {};
+  
+    if (!peripheralId || !bleManagerEmitter) {
+      console.log("Skipping notification setup:", { 
+        peripheralId, 
+        emitter: !!bleManagerEmitter 
+      });
+      return;
     }
 
-    const setupListenersWithDelay = () => {
-      if (!isMounted) return;
-
-      let localBleEmitter: NativeEventEmitter | null = null;
-
-      // Create NativeEventEmitter with NativeModules.BleManager
-      if (NativeModules.BleManager) {
-        localBleEmitter = new NativeEventEmitter(NativeModules.BleManager);
-      } else {
-        //
-        // console.error('CRITICAL: BleManager module not available after delay');
+    console.log("📡 Configurando listener de notificações...");
+  
+    const onCharacteristicChangedHandler = (event: BleManagerDidUpdateValueForCharacteristicEvent) => {
+      const { peripheral, characteristic, service, value } = event;
+  
+      if (!isMounted) {
+        console.log("Handler de Notificação: Componente não montado, ignorando evento.");
         return;
       }
-
-      const onCharacteristicChangedHandler = (event: BleManagerDidUpdateValueForCharacteristicEvent) => {
-        const { peripheral, characteristic, service, value } = event;
-        if (!isMounted || peripheral !== peripheralId) {
-          return;
-        }
-
-        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        let message = `[${timestamp}] S:${service?.slice(-4)} C:${characteristic?.slice(-4)} - `;
-
-        if (isLT716 && service?.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase() &&
-            characteristic?.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase()) {
-          try {
-            message += `NUS ECO: "${Buffer.from(value).toString('utf8')}"`;
-          } catch (e) {
-            const rawValue = Array.isArray(value) ? value.join(',') : String(value);
-            message += `NUS ECO (raw): ${rawValue}`;
-          }
-        } else if (service?.toUpperCase() === BATTERY_SERVICE.toUpperCase() && characteristic?.toUpperCase() === BATTERY_LEVEL_CHAR.toUpperCase()){
-          const batteryLevel = value[0];
-          message += `Battery Level: ${batteryLevel}%`;
-          setDeviceInfo(prev => ({ ...prev, batteryLevel: String(batteryLevel) }));
-        } else {
-          try {
-            const decodedValue = Buffer.from(value).toString('utf8');
-            message += `Data: "${decodedValue}" (Hex: ${Buffer.from(value).toString('hex')})`;
-          } catch (e) {
-            const rawValue = Array.isArray(value) ? value.join(', ') : String(value);
-            message += `Raw: ${rawValue}`;
-          }
-        }
-        // Notification received
-        setNotificationLog(prevLog => `${message}\n${prevLog}`.slice(0, 2000));
-      };
-
-      if (localBleEmitter) {
-        // Registering BleManagerDidUpdateValueForCharacteristic listener
-        notificationListener = localBleEmitter.addListener(
-          'BleManagerDidUpdateValueForCharacteristic',
-          onCharacteristicChangedHandler
-        );
-        // Listener registered successfully
-      } else {
-        // Failed to register listener: localBleEmitter is null
+      if (peripheral !== peripheralId) {
+        console.log(`Handler de Notificação: ID de periférico não corresponde (${peripheral} !== ${peripheralId}), ignorando.`);
         return;
       }
-
-      const startDeviceNotifications = async () => {
-        if (!isMounted) return;
-        if (!peripheralData?.services || peripheralData.services.length === 0) {
-          // peripheralData.services is empty. Cannot start notifications.
-          return;
-        }
-
-        // Starting notifications for characteristics...
-
-        // Notificação de Bateria
-        const batteryServiceInfo = peripheralData.services.find(s => s.uuid.toUpperCase() === BATTERY_SERVICE.toUpperCase());
-        if (batteryServiceInfo) {
-          const batteryCharInfo = peripheralData.characteristics?.find(c => c.service.toUpperCase() === BATTERY_SERVICE.toUpperCase() && c.characteristic.toUpperCase() === BATTERY_LEVEL_CHAR.toUpperCase());
-          if (batteryCharInfo && (batteryCharInfo.properties.Notify || batteryCharInfo.properties.Indicate)) {
-            try {
-              await BleManager.startNotification(peripheralId, BATTERY_SERVICE, BATTERY_LEVEL_CHAR);
-              // Battery notifications started
-            } catch (error) {
-              // Failed to start battery notifications
-            }
-          } else {
-            // Battery characteristic not notifiable or not found
-          }
-        }
-
-        // Notificação NUS para LT716
-        if (isLT716) {
-          const nusServiceInfo = peripheralData.services.find(s => s.uuid.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase());
-          if (nusServiceInfo) {
-            const nusTxCharInfo = peripheralData.characteristics?.find(c => c.service.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase() && c.characteristic.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase());
-            if (nusTxCharInfo && (nusTxCharInfo.properties.Notify || nusTxCharInfo.properties.Indicate)) {
-              try {
-                await BleManager.startNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID);
-                // LT716 NUS TX notifications started
-              } catch (error) {
-                // Failed to start LT716 NUS TX notifications
+  
+      const timestamp = new Date().toLocaleTimeString();
+      const rawBytesArray = Array.from(value); // Garante que é um array de números padrão
+      const hexValue = Buffer.from(rawBytesArray).toString('hex');
+  
+      console.log(`🔔 NOTIFICAÇÃO BRUTA RECEBIDA de ${peripheral} (Svc: ${service?.slice(-6)}, Char: ${characteristic?.slice(-6)})`);
+      console.log(`   Valor (bytes): [${rawBytesArray.join(', ')}]`);
+      console.log(`   Valor (hex): ${hexValue}`);
+  
+      let messageForLog = `[${timestamp}]`;
+  
+      if (isLT716 &&
+          service?.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase() &&
+          characteristic?.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase()) {
+  
+        messageForLog += ` LT716 RX (hex: ${hexValue}):\n`;
+  
+        if (rawBytesArray && rawBytesArray.length > 0) {
+          const packetHeader = rawBytesArray[PKT_IDX.HEADER];
+  
+          if (packetHeader === FitProConstants.DATA_HEADER_ACK) {
+            messageForLog += `   ✅ ACK Recebido!\n`;
+            if (rawBytesArray.length >= 5) { // Tamanho mínimo para um ACK com CG_orig e CMD_orig
+              const originalCmdGroup = rawBytesArray[3]; // Byte 3 do pacote ACK
+              const originalCommand = rawBytesArray[4];  // Byte 4 do pacote ACK
+              messageForLog += `   ACK para Comando Original: Group=0x${originalCmdGroup.toString(16).toUpperCase()}, Cmd=0x${originalCommand.toString(16).toUpperCase()}\n`;
+  
+              if (originalCmdGroup === FitProConstants.CMD_GROUP_GENERAL && originalCommand === FitProConstants.CMD_FIND_BAND) {
+                messageForLog += "      (ACK do Find Band recebido - o relógio vibrou?)\n";
+              } else if (originalCmdGroup === FitProConstants.CMD_GROUP_REQUEST_DATA && originalCommand === FitProConstants.CMD_GET_HW_INFO) {
+                messageForLog += "      (ACK do Get HW Info recebido - aguardando pacote de dados...)\n";
+                
+                // Adicionar timeout para verificar se o pacote de dados chega
+                const hwInfoTimeout = setTimeout(() => {
+                  if (isMounted) {
+                    console.warn('⏱️ Timeout: Nenhum pacote de dados recebido após ACK do HW Info');
+                    setNotificationLog(prev => 
+                      `⏱️ [${new Date().toLocaleTimeString()}] Timeout: Sem dados após ACK\n${prev}`
+                    );
+                  }
+                }, 2000);
+                
+                // Limpar o timeout quando o componente for desmontado
+                return () => clearTimeout(hwInfoTimeout);
               }
             } else {
-              // LT716 NUS TX characteristic not notifiable or not found
+              messageForLog += "      ACK com formato inesperado (muito curto para identificar comando original).\n";
             }
+  
+          } else if (packetHeader === FitProConstants.DATA_HEADER) {
+            messageForLog += `   Pacote de Dados Recebido (0xCD):\n`;
+            if (rawBytesArray.length >= PKT_IDX.PAYLOAD_START) {
+              const receivedCmdGroup = rawBytesArray[PKT_IDX.CMD_GROUP];
+              const receivedCommand = rawBytesArray[PKT_IDX.COMMAND];
+              const payloadLen = (rawBytesArray[PKT_IDX.PAYLOAD_LEN_HI] << 8) | rawBytesArray[PKT_IDX.PAYLOAD_LEN_LO];
+              const actualPayload = rawBytesArray.slice(PKT_IDX.PAYLOAD_START, Math.min(PKT_IDX.PAYLOAD_START + payloadLen, rawBytesArray.length));
+  
+              messageForLog += `     CmdGroup: 0x${receivedCmdGroup.toString(16).toUpperCase()}, Cmd: 0x${receivedCommand.toString(16).toUpperCase()}\n`;
+              messageForLog += `     PayloadLen Declarado: ${payloadLen}, Payload Real Extraído (hex): ${Buffer.from(actualPayload).toString('hex')}\n`;
+  
+              if (receivedCmdGroup === FitProConstants.CMD_GROUP_REQUEST_DATA &&
+                  receivedCommand === FitProConstants.CMD_GET_HW_INFO) {
+                messageForLog += "     Interpretando como resposta de Get HW Info:\n";
+                if (actualPayload && actualPayload.length > 0) {
+                    let offset = 0;
+                    let decodedHwStrings: string[] = [];
+                    let parseError = false;
+                    // Parsear a primeira string
+                    if (offset < actualPayload.length) {
+                        const len1 = actualPayload[offset];
+                        offset++;
+                        if (offset + len1 <= actualPayload.length) {
+                            const str1Bytes = actualPayload.slice(offset, offset + len1);
+                            decodedHwStrings.push(Buffer.from(str1Bytes).toString('utf8'));
+                            offset += len1;
+                        } else { messageForLog += "        Payload HW (s1) incompleto.\n"; parseError = true; }
+                    } else { messageForLog += "        Payload HW (s1) vazio.\n"; parseError = true; }
+                    // Parsear a segunda string
+                    if (!parseError && offset < actualPayload.length) {
+                        const len2 = actualPayload[offset];
+                        offset++;
+                        if (offset + len2 <= actualPayload.length) {
+                            const str2Bytes = actualPayload.slice(offset, offset + len2);
+                            decodedHwStrings.push(Buffer.from(str2Bytes).toString('utf8'));
+                        } else { messageForLog += "        Payload HW (s2) incompleto.\n"; parseError = true; }
+                    } else if (!parseError && actualPayload.length > offset) { messageForLog += "        Payload HW (s2) dados insuficientes.\n"; parseError = true; }
+                    
+                    if (decodedHwStrings.length > 0) {
+                        const hwInfoDisplay = decodedHwStrings.join(' / ');
+                        messageForLog += `        HW Info Decodificado: "${hwInfoDisplay}"\n`;
+                        // @ts-ignore
+                        setDeviceInfo(prev => ({ ...prev, hardwareRevision: hwInfoDisplay }));
+                    } else if (!parseError) { messageForLog += "        Não foi possível decodificar HW Info.\n"; }
+                } else { messageForLog += "        Payload de HW Info vazio.\n"; }
+              }
+              // TODO: Adicionar mais 'else if' para outros comandos
+            } else { messageForLog += "     Pacote de dados (0xCD) muito curto.\n"; }
           } else {
-              // LT716 NUS service not found
+            messageForLog += `   Header desconhecido: 0x${packetHeader.toString(16)}. Não é FitPro.\n`;
+            try {
+              const receivedText = Buffer.from(rawBytesArray).toString('utf8').trim();
+              messageForLog += `   Fallback UTF-8: "${receivedText}"\n`;
+              
+              // Try to interpret as structured text
+              const possibleText = interpretResponseAsText(rawBytesArray);
+              if (possibleText) {
+                messageForLog += `   📝 Texto detectado: "${possibleText}"\n`;
+              }
+            } catch (e) { /* nothing */ }
           }
-        }
-      };
-
-      startDeviceNotifications();
-    };
-
-    // Add a small delay to give the native module time to initialize
-    const timerId = setTimeout(setupListenersWithDelay, 300); // 300ms delay
-
-    return () => {
-      isMounted = false;
-      clearTimeout(timerId);
-      if (notificationListener) {
-        notificationListener.remove();
+        } else { messageForLog += "   Dados LT716 vazios ou inválidos.\n"; }
+        // @ts-ignore
+        setNotificationLog(prevLog => `${messageForLog}\n${prevLog}`.slice(0, 4000));
+  
+      } else if (service?.toUpperCase() === BATTERY_SERVICE.toUpperCase() &&
+                 characteristic?.toUpperCase() === BATTERY_LEVEL_CHAR.toUpperCase()) {
+        const batteryLevel = rawBytesArray[0];
+        messageForLog += ` 🔋 Battery: ${batteryLevel}%`;
+        // @ts-ignore
+        setNotificationLog(prevLog => `${messageForLog}\n${prevLog}`.slice(0, 4000));
+        // @ts-ignore
+        setDeviceInfo(prev => ({ ...prev, batteryLevel: `${batteryLevel}%` }));
+      } else {
+        try {
+            const decodedValue = Buffer.from(rawBytesArray).toString('utf8');
+            messageForLog += ` 📥 S:${service?.slice(-4)} C:${characteristic?.slice(-4)} Data: "${decodedValue}" (hex: ${hexValue})`;
+          } catch (e) {
+            messageForLog += ` 📥 S:${service?.slice(-4)} C:${characteristic?.slice(-4)} Raw (bytes): ${rawBytesArray.join(', ')}`;
+          }
+          // @ts-ignore
+          setNotificationLog(prevLog => `${messageForLog}\n${prevLog}`.slice(0, 4000));
       }
     };
+  
+    // Register the listener
+    notificationListener = bleManagerEmitter.addListener(
+      'BleManagerDidUpdateValueForCharacteristic',
+      (event: BleManagerDidUpdateValueForCharacteristicEvent) => {
+        // Add this log at the START of the handler
+        console.log("🎯 NOTIFICAÇÃO RECEBIDA!", {
+          peripheral: event.peripheral,
+          service: event.service,
+          char: event.characteristic,
+          valueLength: event.value?.length
+        });
+        
+        // Call the original handler
+        onCharacteristicChangedHandler(event);
+      }
+    );
+    
+    console.log("✅ Listener registrado com sucesso!");
+  
+    // Função para iniciar notificações
+
+const startDeviceNotifications = async () => {
+  if (!isMounted || !peripheralId) {
+    console.log("startDeviceNotifications: Componente não montado ou peripheralId ausente.");
+    return;
+  }
+
+  // Verificação mais robusta para peripheralData e suas propriedades necessárias
+  if (!peripheralData || !peripheralData.services || !peripheralData.characteristics) {
+    console.warn('startDeviceNotifications: peripheralData ou seus campos services/characteristics estão indefinidos. Não é possível iniciar notificações.');
+    // @ts-ignore
+    setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ⚠️ ERRO: Dados do periférico (serv/char) incompletos para notif.\n${prev}`);
+    return;
+  }
+  // A partir daqui, sabemos que peripheralData, .services, e .characteristics existem.
+  // .characteristics pode ser um array vazio, o que é tratado pelo .find() retornando undefined.
+
+  console.log('Verificando dados do periférico para notificações...');
+  // console.log('Características disponíveis:', JSON.stringify(peripheralData.characteristics.map(c => ({svc: c.service.slice(-6), char: c.characteristic.slice(-6), props: c.properties})), null, 2));
+
+  // Notificação de Bateria
+  const batteryServiceInfo = peripheralData.services.find(s => s.uuid.toUpperCase() === BATTERY_SERVICE.toUpperCase());
+  if (batteryServiceInfo) {
+    // CORREÇÃO APLICADA AQUI com ?.
+    const batteryCharInfo = peripheralData.characteristics?.find(c =>
+      c.service.toUpperCase() === BATTERY_SERVICE.toUpperCase() &&
+      c.characteristic.toUpperCase() === BATTERY_LEVEL_CHAR.toUpperCase() &&
+      (c.properties.Notify || c.properties.Indicate)
+    );
+    if (batteryCharInfo) {
+      try {
+        console.log(`---> TENTANDO INICIAR NOTIFICAÇÕES para Bateria: ${peripheralId}`);
+        await BleManager.startNotification(peripheralId, BATTERY_SERVICE, BATTERY_LEVEL_CHAR);
+        console.log('✅ SUCESSO AO INICIAR NOTIFICAÇÕES de Bateria!');
+        // @ts-ignore
+        setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ✅ Notificações de Bateria INICIADAS.\n${prev}`);
+      } catch (error) {
+        console.error('❌ ERRO AO INICIAR notificações de Bateria:', error);
+        // @ts-ignore
+        setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ❌ ERRO notif. Bateria: ${String(error)}\n${prev}`);
+      }
+    } else {
+      console.warn("Característica de Nível de Bateria não encontrada ou não notificável.");
+    }
+  }
+  
+
+  // Notificação NUS para LT716
+  if (isLT716) {
+    const nusServiceInfo = peripheralData.services.find(s => s.uuid.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase());
+    if (nusServiceInfo) {
+      // CORREÇÃO APLICADA AQUI com ?.
+      const nusTxCharInfo = peripheralData.characteristics?.find(c =>
+        c.service.toUpperCase() === LT716_NUS_SERVICE_UUID.toUpperCase() &&
+        c.characteristic.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase() &&
+        (c.properties.Notify || c.properties.Indicate)
+      );
+      if (nusTxCharInfo) {
+        try {
+          console.log(`---> TENTANDO INICIAR NOTIFICAÇÕES para LT716 TX: ${peripheralId}`);
+          await BleManager.startNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID);
+          console.log('✅ SUCESSO AO INICIAR NOTIFICAÇÕES LT716 NUS TX!');
+          // @ts-ignore
+          setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ✅ Notificações LT716 INICIADAS.\n${prev}`);
+        } catch (error) {
+          console.error('❌ ERRO AO INICIAR notificações LT716 NUS TX:', error);
+          // @ts-ignore
+          setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ❌ ERRO notif. LT716: ${String(error)}\n${prev}`);
+        }
+      } else {
+        console.warn('Característica TX (`...dcca9d`) do NUS para LT716 não encontrada ou não é notificável.');
+        // @ts-ignore
+        setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ⚠️ Alerta: Char TX LT716 ('...dcca9d') não notificável/encontrada.\n${prev}`);
+      }
+    } else {
+      console.warn('Serviço NUS (`...dcca9d`) do LT716 não encontrado.');
+      // @ts-ignore
+      setNotificationLog(prev => `[${new Date().toLocaleTimeString()}] ⚠️ Alerta: Serviço NUS LT716 não encontrado.\n${prev}`);
+    }
+  }
+};
+    // Chama a ativação das notificações.
+    // O setTimeout anterior foi removido; o ideal é que peripheralData já venha completo.
+    // Se peripheralData.services/characteristics não estiverem prontos, a função startDeviceNotifications fará um 'return'.
+    startDeviceNotifications();
+  
+    return () => {
+      isMounted = false;
+      if (notificationListener) {
+        console.log("<--- Removendo listener BleManagerDidUpdateValueForCharacteristic");
+        notificationListener.remove();
+        console.log("🗑️ Listener BleManagerDidUpdateValueForCharacteristic REMOVIDO.");
+      }
+      // Considere parar as notificações ao desmontar a tela, se fizer sentido para o seu fluxo
+      // Ex: BleManager.stopNotification(peripheralId, LT716_NUS_SERVICE_UUID, LT716_NUS_CHAR_TX_UUID).catch(e => console.log("Error stopping LT716 NUS TX notification on unmount", e));
+      // Ex: BleManager.stopNotification(peripheralId, BATTERY_SERVICE, BATTERY_LEVEL_CHAR).catch(e => console.log("Error stopping Battery notification on unmount", e));
+    };
   }, [peripheralId, isLT716, peripheralData]);
+  const sendFindBandFitPro = async () => {
+    const commandBytes = buildFitProCommand(
+      FitProConstants.CMD_GROUP_GENERAL,
+      FitProConstants.CMD_FIND_BAND,
+      [FitProConstants.VALUE_ON] // [0x01]
+    );
+    await writeBytesToDevice(commandBytes, "Find Band");
+  };
+  
+  
+  const sendGetHwInfoFitPro = async () => {
+    const commandBytes = buildFitProCommand(
+      FitProConstants.CMD_GROUP_REQUEST_DATA,
+      FitProConstants.CMD_GET_HW_INFO,
+      []
+    );
+    await writeBytesToDevice(commandBytes, "Get HW Info");
+  };
 
-  // Function to write data
-  const handleWriteData = async () => {
+  const writeBytesToDevice = async (bytesToSend: number[], commandName: string = 'Command') => {
     if (!peripheralId || !serviceToWrite || !charToWrite) {
-      setReadData('Error: Device or characteristic not ready for writing.');
-      // Missing peripheralId, service, or characteristic UUID for writing
-      return;
+      // @ts-ignore
+      setReadData(prev => `❌ Error: Device/Char not ready for ${commandName}.\n${prev}`.slice(0, 1000));
+      return false;
     }
-    if (!textToWrite.trim()) {
-      setReadData('Error: No data to send.');
-      return;
+    if (!bytesToSend || bytesToSend.length === 0) {
+      // @ts-ignore
+      setReadData(prev => `⚠️ Error: No data to send for ${commandName}.\n${prev}`.slice(0, 1000));
+      return false;
     }
-
     try {
-      const dataBytes = Array.from(Buffer.from(textToWrite, 'utf8'));
-      // Writing data to characteristic
-      setReadData(`Sending: "${textToWrite}"...`);
-      await BleManager.write(peripheralId, serviceToWrite, charToWrite, dataBytes);
-      setReadData(`Successfully sent: "${textToWrite}"`);
-      setTextToWrite(''); // Clear input after successful write
+      const hexToSend = Buffer.from(bytesToSend).toString('hex');
+      // @ts-ignore
+      setReadData(prev => `📤 Sending ${commandName}: ${hexToSend}...\n${prev}`.slice(0, 1000));
+      console.log(`Sending ${commandName} bytes: [${bytesToSend.join(', ')}] (hex: ${hexToSend})`);
+      console.log('To service:', serviceToWrite);
+      console.log('To characteristic:', charToWrite);
+  
+      await BleManager.write(peripheralId, serviceToWrite, charToWrite, bytesToSend);
+  
+      const timestamp = new Date().toLocaleTimeString();
+      // @ts-ignore
+      setReadData(prev => `✅ [${timestamp}] Sent ${commandName}: ${hexToSend}\n${prev}`.slice(0, 1000));
+      // @ts-ignore
+      setNotificationLog(prev => `📤 [${timestamp}] SENT ${commandName} (hex: ${hexToSend})\n${prev}`.slice(0, 4000));
+      console.log(`📨 ${commandName} ENVIADO! Aguardando resposta...`);
+      return true;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      // Error writing data
-      setReadData(`Write Error: ${errMsg}`);
+      console.error(`Write error for ${commandName}:`, error);
+      // @ts-ignore
+      setReadData(prev => `❌ Write Error for ${commandName}: ${errMsg}\n${prev}`.slice(0, 1000));
+      return false;
     }
   };
   
@@ -547,6 +1236,15 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
           <Text style={styles.rssiButtonText}>View RSSI Chart</Text>
         </TouchableOpacity>
       </View>
+      <TouchableOpacity 
+  style={[styles.quickCommandButton, {backgroundColor: '#FF6B6B'}]}
+  onPress={() => {
+    // Envia um texto de teste
+    sendTextAsNotification("Olá LT716!");
+  }}
+>
+  <Text style={styles.quickCommandText}>Send Text</Text>
+</TouchableOpacity>
 
       {/* Services Card - Simplified */}
        <View style={styles.card}>
@@ -557,7 +1255,30 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
             <Text style={styles.infoValue}>No services discovered or reported by peripheral.</Text>
         )}
       </View>
-
+      <TouchableOpacity 
+  style={[styles.quickCommandButton, {backgroundColor: '#FF9500'}]}
+  
+  onPress={async () => {
+    // Testa envio de texto simples
+    const testText = "Hello BLE";
+    const textBytes = Array.from(Buffer.from(testText + '\r\n', 'utf8'));
+    
+    try {
+      await BleManager.write(peripheralId, serviceToWrite, charToWrite, textBytes);
+      console.log('Texto enviado:', testText);
+      
+      // Aguarda resposta
+      setTimeout(() => {
+        console.log('Verifique o log de notificações para resposta');
+      }, 1000);
+    } catch (error) {
+      console.error('Erro:', error);
+    }
+    
+  }}
+>
+  <Text style={styles.quickCommandText}>Test Text</Text>
+</TouchableOpacity>
 
       {/* Write Interaction Card */}
       {(isLT716 || serviceToWrite) && ( // Show if LT716 or if any writable service is configured
@@ -573,8 +1294,87 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
                 onChangeText={setTextToWrite}
                 placeholderTextColor="#999"
               />
-              <TouchableOpacity style={styles.styledButton} onPress={handleWriteData}>
+              <TouchableOpacity style={styles.styledButton} onPress={sendFindBandFitPro}>
                 <Text style={styles.styledButtonText}>Write</Text>
+              </TouchableOpacity>
+              
+              <View style={styles.quickCommandsContainer}>
+  <Text style={styles.quickCommandsLabel}>FitPro Commands:</Text>
+  <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+    <TouchableOpacity 
+      style={styles.quickCommandButton} 
+      onPress={sendFindBandFitPro}
+    >
+      <Text style={styles.quickCommandText}>Find Band</Text>
+    </TouchableOpacity>
+    
+    <TouchableOpacity 
+      style={[styles.quickCommandButton, {backgroundColor: '#FF9500'}]}
+      onPress={async () => {
+        console.log('🧪 Teste de comunicação...');
+        
+        // 1. Verificar se está conectado
+        const isConnected = await BleManager.isPeripheralConnected(peripheralId, []);
+        console.log('Conectado?', isConnected);
+        
+        // 2. Verificar notificações
+        const services = await BleManager.retrieveServices(peripheralId);
+        const txChar = services.characteristics?.find(c => 
+          c.characteristic.toUpperCase() === LT716_NUS_CHAR_TX_UUID.toUpperCase()
+        );
+        console.log('TX Char notificando?', txChar?.isNotifying);
+        
+        // 3. Enviar comando simples
+        await sendFindBandFitPro();
+      }}
+    >
+      <Text style={styles.quickCommandText}>Test Comm</Text>
+    </TouchableOpacity>
+    
+    <TouchableOpacity 
+      style={styles.quickCommandButton} 
+      onPress={sendGetHwInfoFitPro}
+    >
+      <Text style={styles.quickCommandText}>HW Info</Text>
+    </TouchableOpacity>
+    
+    <TouchableOpacity 
+      style={[styles.quickCommandButton, {backgroundColor: '#4CAF50'}]}
+      onPress={initializeLT716Device}
+    >
+      <Text style={styles.quickCommandText}>Init Device</Text>
+    </TouchableOpacity>
+    
+    <TouchableOpacity 
+      style={styles.quickCommandButton} 
+      onPress={async () => {
+        // Get band name
+        await writeBytesToDevice(
+          buildFitProCommand(
+            FitProConstants.CMD_GROUP_BAND_INFO,
+            FitProConstants.CMD_GET_BAND_NAME,
+            []
+          ),
+          "Get Band Name"
+        );
+      }}
+    >
+      <Text style={styles.quickCommandText}>Band Name</Text>
+    </TouchableOpacity>
+    
+    <TouchableOpacity 
+      style={[styles.quickCommandButton, {backgroundColor: '#9C27B0'}]}
+      onPress={() => testFitProCommands(writeBytesToDevice)}
+    >
+      <Text style={styles.quickCommandText}>Test All</Text>
+    </TouchableOpacity>
+  </ScrollView>
+</View>
+              <TouchableOpacity 
+                style={[styles.styledButton, {backgroundColor: '#34C759', marginTop: 10}]} 
+                onPress={restartNotifications}
+              >
+                <Text style={styles.styledButtonText}>🔄 Restart Notifications</Text>
               </TouchableOpacity>
             </>
           ) : (
@@ -591,6 +1391,26 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
         </ScrollView>
          <TouchableOpacity style={[styles.clearButton]} onPress={() => setReadData('')}>
             <Text style={styles.clearButtonText}>Clear Data Log</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Notifications Card - Shows data received from the device */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Notifications (Received Data)</Text>
+        <ScrollView 
+          style={styles.notificationBox} 
+          ref={notificationsScrollViewRef}
+          onContentSizeChange={() => notificationsScrollViewRef.current?.scrollToEnd({ animated: true })}
+        >
+          <Text style={styles.notificationText}>
+            {notificationLog || 'Waiting for notifications from device...'}
+          </Text>
+        </ScrollView>
+        <TouchableOpacity 
+          style={[styles.clearButton, {backgroundColor: '#FF9500'}]} 
+          onPress={() => setNotificationLog('')}
+        >
+          <Text style={styles.clearButtonText}>Clear Notifications</Text>
         </TouchableOpacity>
       </View>
 
@@ -669,6 +1489,50 @@ const PeripheralDetailsScreen = ({ route }: PeripheralDetailsProps) => {
   );
 };
 
+// Componente visual para mostrar mensagens decodificadas
+const FitProMessageDecoder = ({ message }: { message: number[] }) => {
+  const decoded = decodeFitProMessage(message);
+  
+  return (
+    <View style={styles.decodedMessageBox}>
+      <Text style={styles.decodedMessageText}>{decoded}</Text>
+    </View>
+  );
+};
+
+// Função para testar comandos e ver respostas
+const testFitProCommands = async (writeBytesToDevice: (bytes: number[], description: string) => Promise<boolean>) => {
+  console.log('🧪 Testando comandos FitPro...');
+  
+  // Array de comandos para testar
+  const testCommands = [
+    {
+      name: 'Get Steps',
+      cmd: buildFitProCommand(0x15, 0x06, [0x01])
+    },
+    {
+      name: 'Get Heart Rate',
+      cmd: buildFitProCommand(0x12, 0x0D, [0x01])
+    },
+    {
+      name: 'Get Band Name',
+      cmd: buildFitProCommand(0x20, 0x23, [])
+    }
+  ];
+  
+  for (const test of testCommands) {
+    console.log(`\n📤 Enviando: ${test.name}`);
+    const success = await writeBytesToDevice(test.cmd, test.name);
+    if (!success) {
+      console.warn(`⚠️ Falha ao enviar comando: ${test.name}`);
+      continue;
+    }
+    
+    // Aguarda resposta
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+};
+
 const styles = StyleSheet.create({
   screenContainer: {
     flex: 1,
@@ -713,6 +1577,42 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
     color: '#34C759', // iOS Green for connected
+  },
+  notificationBox: {
+    backgroundColor: '#F0F0F7',
+    borderWidth: 1,
+    borderColor: '#D1D1D6',
+    borderRadius: 8,
+    padding: 10,
+    minHeight: 120,
+    maxHeight: 200,
+    marginBottom: 10,
+  },
+  notificationText: {
+    fontSize: 12,
+    color: '#000000',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    lineHeight: 18,
+  },
+  quickCommandsContainer: {
+    marginVertical: 10,
+  },
+  quickCommandsLabel: {
+    fontSize: 13,
+    color: '#6D6D72',
+    marginBottom: 8,
+  },
+  quickCommandButton: {
+    backgroundColor: '#E5E5EA',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+    marginRight: 8,
+  },
+  quickCommandText: {
+    fontSize: 13,
+    color: '#007AFF',
+    fontWeight: '500',
   },
   rssiText: {
     fontSize: 13,
@@ -933,6 +1833,19 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     color: '#333',
   },
+  decodedMessageBox: {
+    backgroundColor: '#F0F8FF',
+    borderWidth: 1,
+    borderColor: '#007AFF',
+    borderRadius: 8,
+    padding: 10,
+    marginVertical: 5,
+  },
+  decodedMessageText: {
+    fontSize: 13,
+    color: '#000',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
    modalTextCurrentRssi: {
     fontSize: 16,
     fontWeight: '500',
@@ -989,6 +1902,14 @@ const styles = StyleSheet.create({
     color: '#8A8A8E',
     fontStyle: 'italic',
   },
+  // Decoder styles
 });
 
 export default PeripheralDetailsScreen;
+function isPrintableText(text: string): boolean {
+  // Regular expression that matches any non-printable ASCII character
+  // except for newlines, tabs, etc.
+  const nonPrintableRegex = /[^\x20-\x7E\n\r\t]/;
+  return !nonPrintableRegex.test(text);
+}
+

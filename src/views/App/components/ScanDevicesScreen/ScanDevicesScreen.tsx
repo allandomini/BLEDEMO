@@ -1,7 +1,7 @@
 
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   SafeAreaView,
   StyleSheet,
@@ -17,10 +17,10 @@ import {
   TouchableOpacity,
   Dimensions,
 } from 'react-native';
+import { Alert } from 'react-native';
 import { LineChart } from 'react-native-gifted-charts';
-// Note: Colors from 'react-native/Libraries/NewAppScreen' might not be needed
-// if you define all colors in your stylesheet.
-// import { Colors } from 'react-native/Libraries/NewAppScreen'; 
+import { useBle } from '../../../../hooks/useBle';
+import { bleService } from '../../../../services/BleService';
 import BleManager, {
   BleDisconnectPeripheralEvent,
   BleManagerDidUpdateValueForCharacteristicEvent,
@@ -58,46 +58,199 @@ declare module 'react-native-ble-manager' {
 
 const ScanDevicesScreen = () => {
   const navigation = useNavigation<NavigationProp>();
+  
+  // Use the useBle hook
+  const {
+    isScanning,
+    isInitialized,
+    error,
+    initializeBle,
+    checkBluetoothState,
+    connectToDevice,
+    disconnectDevice,
+    setIsScanning,
+  } = useBle();
 
-  const [isScanning, setIsScanning] = useState(false);
   const [selectedPeripheralForChart, setSelectedPeripheralForChart] = useState<ScannedPeripheral | null>(null);
   const [isScanChartModalVisible, setIsScanChartModalVisible] = useState(false);
   const [peripherals, setPeripherals] = useState(
     new Map<Peripheral['id'], ScannedPeripheral>()
   );
-
-  const startScan = () => {
-    if (!isScanning) {
-      setPeripherals(new Map<Peripheral['id'], ScannedPeripheral>()); // Clear previous scan results
-      try {
-        console.debug('[startScan] starting scan...');
-        setIsScanning(true);
-        BleManager.scan(SERVICE_UUIDS, SECONDS_TO_SCAN_FOR, ALLOW_DUPLICATES, {
-          matchMode: BleScanMatchMode.Sticky,
-          scanMode: BleScanMode.LowLatency,
-          callbackType: BleScanCallbackType.AllMatches,
-        })
-          .then(() => {
-            console.debug('[startScan] scan promise returned successfully.');
-          })
-          .catch((err: any) => {
-            console.error('[startScan] ble scan returned in error', err);
-            setIsScanning(false); // Ensure scanning state is reset on error
-          });
-      } catch (error) {
-        console.error('[startScan] ble scan error thrown', error);
-        setIsScanning(false); // Ensure scanning state is reset on error
+  
+  // Refs para armazenar os timeouts
+  const scanTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
+  
+  // Initialize BLE on component mount
+  useEffect(() => {
+    const init = async () => {
+      await initializeBle();
+      await checkBluetoothState();
+    };
+    
+    init();
+    
+    return () => {
+      // Clean up any ongoing connections or scans
+      if (isScanning) {
+        BleManager.stopScan().catch(console.error);
+        setIsScanning(false);
       }
+      if (scanTimeoutRef.current) {
+        clearTimeout(scanTimeoutRef.current);
+        scanTimeoutRef.current = null;
+      }
+    };
+  }, [initializeBle, checkBluetoothState]);
+
+  const handleStopScan = useCallback(async (fromAutoStop = false) => {
+    console.log(`🛑 handleStopScan called, isScanning: ${isScanning}, fromAutoStop: ${fromAutoStop}`);
+    
+    // Clear any pending timeout first
+    if (scanTimeoutRef.current) {
+      console.log('⏱️ Clearing scan timeout');
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
     }
-  };
+    
+    // Only try to stop scan if we think we're scanning
+    if (isScanning) {
+      try {
+        console.log('🛑 Stopping BLE scan...');
+        await BleManager.stopScan();
+        console.log('✅ BLE scan stopped successfully');
+      } catch (err) {
+        console.error('❌ Error stopping BLE scan:', err);
+        // Even if there's an error, we should update the UI state
+      } finally {
+        // Always update the scanning state to false when we're done
+        console.log('ℹ️ Updating scan state to false');
+        setIsScanning(false);
+      }
+    } else if (fromAutoStop) {
+      // If we get here, it means the timeout fired but we don't think we're scanning
+      // This can happen if the scan was already stopped manually
+      console.log('ℹ️ Auto-stop triggered but scan was already stopped');
+      setIsScanning(false);
+    }
+  }, [isScanning, setIsScanning]);
+
+  const startScan = useCallback(async () => {    
+    console.log('🔍 startScan called');
+    
+    // Prevent multiple simultaneous scans
+    if (isScanning) {
+      console.log('ℹ️ Scan already in progress, stopping current scan first...');
+      await handleStopScan();
+      // Add a small delay to ensure the previous scan is fully stopped
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    // Clear any pending timeouts
+    if (scanTimeoutRef.current) {
+      console.log('⏱️ Clearing previous scan timeout');
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
+    }
+
+    try {
+      console.log('🔍 === STARTING SCAN PROCESS ===');
+      
+      if (!isInitialized) {
+        const initialized = await initializeBle();
+        if (!initialized) {
+          throw new Error('Falha ao inicializar o serviço BLE. Verifique as permissões e tente novamente.');
+        }
+      }
+      
+      // Check Bluetooth state
+      const isBluetoothEnabled = await checkBluetoothState();
+      console.log('📱 Bluetooth enabled:', isBluetoothEnabled);
+      
+      if (!isBluetoothEnabled) {
+        // On Android, we can try to enable Bluetooth
+        if (Platform.OS === 'android') {
+          try {
+            await BleManager.enableBluetooth();
+            // Wait a bit for Bluetooth to enable
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Try to scan again
+            startScan();
+            return;
+          } catch (enableError) {
+            console.error('Failed to enable Bluetooth:', enableError);
+          }
+        }
+        
+        Alert.alert(
+          'Bluetooth Não Disponível',
+          'Por favor, verifique se o Bluetooth está ligado e se o aplicativo tem as permissões necessárias.',
+          [
+            { 
+              text: 'Tentar Novamente', 
+              onPress: () => startScan() 
+            },
+            { 
+              text: 'OK', 
+              style: 'cancel' 
+            }
+          ]
+        );
+        return;
+      }
+        
+      // Clear previous results
+      setPeripherals(new Map<Peripheral['id'], ScannedPeripheral>());
+      
+      console.log('🔍 Starting BLE scan...');
+      console.log('📋 Scan parameters:', {
+        serviceUUIDs: SERVICE_UUIDS,
+        seconds: SECONDS_TO_SCAN_FOR,
+        allowDuplicates: ALLOW_DUPLICATES
+      });
+      
+      // Set scanning state through the hook
+      setIsScanning(true);
+      
+      // Start the scan
+      await BleManager.scan(SERVICE_UUIDS, SECONDS_TO_SCAN_FOR, ALLOW_DUPLICATES, {
+        matchMode: BleScanMatchMode.Sticky,
+        scanMode: BleScanMode.LowLatency,
+        callbackType: BleScanCallbackType.AllMatches,
+      });
+      
+      console.log('✅ Scan started successfully');
+      
+      // Auto-stop scan after timeout
+      console.log(`⏱️ Setting auto-stop timeout for ${SECONDS_TO_SCAN_FOR} seconds`);
+      scanTimeoutRef.current = setTimeout(() => {
+        console.log('⏱️ Auto-stop timeout reached, stopping scan...');
+        handleStopScan(true); // Pass true to indicate this is an auto-stop
+      }, SECONDS_TO_SCAN_FOR * 1000);
+        
+    } catch (error) {
+      console.error('❌ Scan error:', error);
+      setIsScanning(false);
+      
+      Alert.alert(
+        'Erro ao Escanear',
+        `Não foi possível iniciar o scan: ${error instanceof Error ? error.message : String(error)}`,
+        [
+          { 
+            text: 'Tentar Novamente', 
+            onPress: () => startScan() 
+          },
+          { 
+            text: 'OK', 
+            style: 'cancel' 
+          }
+        ]
+      );
+    }
+  }, [isScanning, isInitialized, initializeBle, checkBluetoothState, handleStopScan, setIsScanning]);
 
   // Removed startCompanionScan, enableBluetooth, retrieveServices, readCharacteristics, getAssociatedPeripherals
   // from direct UI interaction based on the mockup. The logic can remain if used internally.
 
-  const handleStopScan = () => {
-    setIsScanning(false);
-    console.debug('[handleStopScan] scan is stopped.');
-  };
 
   const handleDisconnectedPeripheral = (
     event: BleDisconnectPeripheralEvent
@@ -256,10 +409,48 @@ const ScanDevicesScreen = () => {
     return new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
 
+  // Initialize BLE Manager when component mounts
   useEffect(() => {
+    const initializeBLE = async () => {
+      try {
+        await BleManager.start({ showAlert: false });
+        console.log('✅ BleManager initialized successfully');
+        
+        // Check if Bluetooth is enabled
+        const state = await BleManager.checkState();
+        console.log('📱 Bluetooth state:', state);
+        
+        if (state === 'off') {
+          console.warn('⚠️ Bluetooth is OFF');
+          // On iOS, we can't turn it on automatically
+          if (Platform.OS === 'ios') {
+            Alert.alert(
+              'Bluetooth Desligado',
+              'Por favor, ligue o Bluetooth nas configurações do seu dispositivo.',
+              [{ text: 'OK' }]
+            );
+          }
+        }
+      } catch (error) {
+        console.error('❌ Failed to initialize BleManager:', error);
+      }
+    };
+
+    initializeBLE();
+  }, []); // Empty array to run only once
+
+  useEffect(() => {
+    // Create a local reference to handleStopScan that won't change
+    const handleStopScanLocal = (event: any) => {
+      console.log('🔍 onStopScan event received');
+      // Don't call handleStopScan here to avoid duplicate calls
+      // Just update the UI state
+      setIsScanning(false);
+    };
+    
     const listeners = [
       BleManager.onDiscoverPeripheral(handleDiscoverPeripheral),
-      BleManager.onStopScan(handleStopScan),
+      BleManager.onStopScan(handleStopScanLocal), // Use local handler for stop scan event
       BleManager.onConnectPeripheral(handleConnectPeripheral),
       BleManager.onDidUpdateValueForCharacteristic(
         handleUpdateValueForCharacteristic
@@ -335,9 +526,8 @@ const ScanDevicesScreen = () => {
           <View style={styles.deviceInfo}>
             <Text style={styles.peripheralName}>
               {item.name || 'N/A'}
-              {item.connecting && <Text style={styles.connectingText}> - Connecting...</Text>}
-              {item.connected && <Text style={styles.connectedText}> - Connected</Text>}
-            </Text>
+              {item.connecting ? <Text style={styles.connectingText}> - Connecting...</Text> : null}
+              {item.connected ? <Text style={styles.connectedText}> - Connected</Text> : null}   </Text>
             <Text style={styles.peripheralId}>{item.id}</Text>
           </View>
           <View style={styles.deviceStatus}>
@@ -371,7 +561,7 @@ const ScanDevicesScreen = () => {
     <>
       <StatusBar backgroundColor="#0069C0" barStyle="light-content" /> {/* Darker blue for status bar to match mockup */}
       <SafeAreaView style={styles.body}>
-        <Text style={styles.headerTitle}>Nearby BLE Devices</Text>
+        <Text style={styles.headerTitle}>BLE Devices</Text>
         
         <Pressable 
           style={({ pressed }) => [
